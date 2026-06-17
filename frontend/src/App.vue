@@ -111,6 +111,10 @@ const waveformData = reactive({})
 
 let ws = null
 let reconnectTimer = null
+let watchdogTimer = null
+let lastMessageTime = 0
+const WATCHDOG_INTERVAL = 3000
+const STALE_THRESHOLD = 5000
 
 const currentScript = computed(() => {
   return scripts.value.find(s => s.id === currentScriptId.value)
@@ -242,39 +246,139 @@ function connectWebSocket() {
   const wsUrl = `${protocol}//${host}/ws/waveform`
 
   try {
+    if (ws) {
+      try { ws.close() } catch (e) { /* ignore */ }
+      ws = null
+    }
+
     ws = new WebSocket(wsUrl)
 
-    ws.onopen = () => {
-      console.log('WebSocket 连接已建立')
+    ws.onopen = async () => {
+      console.log('[WS] 连接已建立')
       wsConnected.value = true
+      lastMessageTime = Date.now()
+      startWatchdog()
+      await syncPlaybackState()
     }
 
     ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        if (data.type === 'waveform' && data.data) {
-          data.data.forEach(wave => {
-            waveformData[wave.trackId] = wave.amplitudes
-          })
-        }
-      } catch (e) {
-        console.error('解析 WebSocket 消息失败:', e)
-      }
+      lastMessageTime = Date.now()
+      handleWsMessage(event.data)
     }
 
     ws.onclose = () => {
-      console.log('WebSocket 连接已关闭')
+      console.log('[WS] 连接已关闭')
       wsConnected.value = false
+      stopWatchdog()
       scheduleReconnect()
     }
 
     ws.onerror = (error) => {
-      console.error('WebSocket 错误:', error)
+      console.error('[WS] 连接错误:', error)
       wsConnected.value = false
     }
   } catch (e) {
-    console.error('创建 WebSocket 失败:', e)
+    console.error('[WS] 创建连接失败:', e)
     scheduleReconnect()
+  }
+}
+
+function handleWsMessage(rawData) {
+  if (!rawData || typeof rawData !== 'string') return
+
+  let data
+  try {
+    data = JSON.parse(rawData)
+  } catch (e) {
+    console.warn('[WS] 消息解析失败, 已跳过')
+    return
+  }
+
+  if (!data || !data.type) return
+
+  if (data.type === 'heartbeat') {
+    return
+  }
+
+  if (data.type === 'waveform') {
+    const waves = data.data
+    if (!Array.isArray(waves)) return
+
+    for (let i = 0; i < waves.length; i++) {
+      const wave = waves[i]
+      if (!wave || !wave.trackId || !Array.isArray(wave.amplitudes)) continue
+
+      if (!(wave.trackId in waveformData)) {
+        waveformData[wave.trackId] = []
+      }
+      for (let j = 0; j < wave.amplitudes.length; j++) {
+        waveformData[wave.trackId][j] = wave.amplitudes[j]
+      }
+      while (waveformData[wave.trackId].length > wave.amplitudes.length) {
+        waveformData[wave.trackId].pop()
+      }
+    }
+    return
+  }
+
+  if (data.type === 'error') {
+    console.warn('[WS] 收到服务端错误信号')
+    return
+  }
+}
+
+function startWatchdog() {
+  stopWatchdog()
+  watchdogTimer = setInterval(() => {
+    const now = Date.now()
+    const staleness = now - lastMessageTime
+
+    if (staleness > STALE_THRESHOLD) {
+      console.warn(`[WS] 消息静默 ${staleness}ms, 判定连接僵死, 强制重连`)
+      forceReconnect()
+    }
+  }, WATCHDOG_INTERVAL)
+}
+
+function stopWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer)
+    watchdogTimer = null
+  }
+}
+
+function forceReconnect() {
+  stopWatchdog()
+  wsConnected.value = false
+  try {
+    if (ws) {
+      ws.onclose = null
+      ws.onerror = null
+      ws.close()
+    }
+  } catch (e) { /* ignore */ }
+  ws = null
+  scheduleReconnect()
+}
+
+async function syncPlaybackState() {
+  try {
+    const res = await playbackApi.getState()
+    const state = res.data
+    if (!state) return
+
+    updatePlaybackState(state)
+    if (state.tracks) {
+      updateTrackStates(state.tracks)
+      state.tracks.forEach(t => {
+        if (!(t.trackId in waveformData)) {
+          waveformData[t.trackId] = new Array(64).fill(0)
+        }
+      })
+    }
+    console.log('[WS] 重连后同步播放状态完成, playing=', state.playing)
+  } catch (e) {
+    console.warn('[WS] 重连后同步状态失败, 将在下次重连时重试:', e.message)
   }
 }
 
@@ -292,8 +396,9 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  stopWatchdog()
   if (ws) {
-    ws.close()
+    try { ws.close() } catch (e) { /* ignore */ }
   }
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)

@@ -10,18 +10,26 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 @Slf4j
 @Service
 public class AudioService {
 
     private final Map<String, Script> scripts = new ConcurrentHashMap<>();
-    private final Map<String, TrackRuntime> trackRuntimes = new ConcurrentHashMap<>();
+
+    private final AtomicReference<Map<String, TrackRuntime>> trackRuntimesRef =
+            new AtomicReference<>(Collections.emptyMap());
+
+    private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
+
     private volatile String currentScriptId;
     private volatile boolean isPlaying = false;
 
@@ -117,21 +125,29 @@ public class AudioService {
             return Mono.error(new IllegalArgumentException("剧本不存在: " + scriptId));
         }
 
-        stopAllTracks();
-        currentScriptId = scriptId;
-        isPlaying = true;
+        stateLock.writeLock().lock();
+        try {
+            Map<String, TrackRuntime> newRuntimes = new HashMap<>();
+            long now = System.currentTimeMillis();
 
-        for (Track track : script.getTracks()) {
-            TrackRuntime runtime = TrackRuntime.builder()
-                    .track(track)
-                    .playing(true)
-                    .currentTime(0)
-                    .startTime(System.currentTimeMillis())
-                    .phase(ThreadLocalRandom.current().nextDouble(0, Math.PI * 2))
-                    .frequency(baseFrequency(track.getType()))
-                    .build();
-            trackRuntimes.put(track.getId(), runtime);
-            log.info("开始播放音轨: {} ({})", track.getName(), track.getId());
+            for (Track track : script.getTracks()) {
+                TrackRuntime runtime = TrackRuntime.builder()
+                        .track(track)
+                        .playing(true)
+                        .currentTime(0)
+                        .startTime(now)
+                        .phase(ThreadLocalRandom.current().nextDouble(0, Math.PI * 2))
+                        .frequency(baseFrequency(track.getType()))
+                        .build();
+                newRuntimes.put(track.getId(), runtime);
+                log.info("开始播放音轨: {} ({})", track.getName(), track.getId());
+            }
+
+            currentScriptId = scriptId;
+            trackRuntimesRef.set(Collections.unmodifiableMap(newRuntimes));
+            isPlaying = true;
+        } finally {
+            stateLock.writeLock().unlock();
         }
 
         return getPlaybackState();
@@ -147,15 +163,25 @@ public class AudioService {
     }
 
     public Mono<PlaybackState> pauseScript() {
-        isPlaying = false;
-        trackRuntimes.values().forEach(runtime -> runtime.setPlaying(false));
+        stateLock.readLock().lock();
+        try {
+            isPlaying = false;
+            trackRuntimesRef.get().values().forEach(runtime -> runtime.setPlaying(false));
+        } finally {
+            stateLock.readLock().unlock();
+        }
         log.info("暂停播放");
         return getPlaybackState();
     }
 
     public Mono<PlaybackState> resumeScript() {
-        isPlaying = true;
-        trackRuntimes.values().forEach(runtime -> runtime.setPlaying(true));
+        stateLock.readLock().lock();
+        try {
+            isPlaying = true;
+            trackRuntimesRef.get().values().forEach(runtime -> runtime.setPlaying(true));
+        } finally {
+            stateLock.readLock().unlock();
+        }
         log.info("恢复播放");
         return getPlaybackState();
     }
@@ -167,82 +193,142 @@ public class AudioService {
     }
 
     private void stopAllTracks() {
-        isPlaying = false;
-        trackRuntimes.clear();
-        currentScriptId = null;
+        stateLock.writeLock().lock();
+        try {
+            isPlaying = false;
+            trackRuntimesRef.set(Collections.emptyMap());
+            currentScriptId = null;
+        } finally {
+            stateLock.writeLock().unlock();
+        }
     }
 
     public Mono<PlaybackState> setTrackVolume(String trackId, double volume) {
-        TrackRuntime runtime = trackRuntimes.get(trackId);
-        if (runtime != null) {
-            runtime.getTrack().setVolume(Math.max(0, Math.min(1, volume)));
+        double safeVolume = Math.max(0, Math.min(1, volume));
+        stateLock.readLock().lock();
+        try {
+            TrackRuntime runtime = trackRuntimesRef.get().get(trackId);
+            if (runtime != null && runtime.getTrack() != null) {
+                runtime.getTrack().setVolume(safeVolume);
+            }
+        } finally {
+            stateLock.readLock().unlock();
         }
         return getPlaybackState();
     }
 
     public Mono<PlaybackState> toggleTrack(String trackId, boolean play) {
-        TrackRuntime runtime = trackRuntimes.get(trackId);
-        if (runtime != null) {
-            runtime.setPlaying(play);
-            runtime.getTrack().setPlaying(play);
+        stateLock.readLock().lock();
+        try {
+            TrackRuntime runtime = trackRuntimesRef.get().get(trackId);
+            if (runtime != null) {
+                runtime.setPlaying(play);
+                if (runtime.getTrack() != null) {
+                    runtime.getTrack().setPlaying(play);
+                }
+            }
+        } finally {
+            stateLock.readLock().unlock();
         }
         return getPlaybackState();
     }
 
     public Mono<PlaybackState> getPlaybackState() {
         List<PlaybackState.TrackState> trackStates = new ArrayList<>();
-        for (TrackRuntime runtime : trackRuntimes.values()) {
-            Track track = runtime.getTrack();
-            trackStates.add(PlaybackState.TrackState.builder()
-                    .trackId(track.getId())
-                    .trackName(track.getName())
-                    .playing(runtime.isPlaying())
-                    .volume(track.getVolume())
-                    .currentTime(runtime.getCurrentTime())
-                    .duration(180.0)
-                    .build());
+        stateLock.readLock().lock();
+        try {
+            Map<String, TrackRuntime> snapshot = trackRuntimesRef.get();
+            for (TrackRuntime runtime : snapshot.values()) {
+                if (runtime == null || runtime.getTrack() == null) continue;
+                Track track = runtime.getTrack();
+                trackStates.add(PlaybackState.TrackState.builder()
+                        .trackId(track.getId())
+                        .trackName(track.getName())
+                        .playing(runtime.isPlaying())
+                        .volume(track.getVolume())
+                        .currentTime(runtime.getCurrentTime())
+                        .duration(180.0)
+                        .build());
+            }
+
+            PlaybackState state = PlaybackState.builder()
+                    .scriptId(currentScriptId)
+                    .playing(isPlaying)
+                    .tracks(trackStates)
+                    .build();
+
+            return Mono.just(state);
+        } finally {
+            stateLock.readLock().unlock();
         }
-
-        PlaybackState state = PlaybackState.builder()
-                .scriptId(currentScriptId)
-                .playing(isPlaying)
-                .tracks(trackStates)
-                .build();
-
-        return Mono.just(state);
     }
 
     public Flux<WaveformData> getWaveformStream() {
         return Flux.interval(Duration.ofMillis(50))
                 .subscribeOn(Schedulers.parallel())
+                .onBackpressureDrop()
                 .filter(tick -> isPlaying)
-                .flatMap(tick -> {
-                    List<WaveformData> waveforms = new ArrayList<>();
+                .concatMap(tick -> {
+                    if (!isPlaying) return Flux.empty();
+
+                    Map<String, TrackRuntime> snapshot;
+                    try {
+                        snapshot = trackRuntimesRef.get();
+                    } catch (Exception e) {
+                        log.warn("获取音轨快照失败: {}", e.getMessage());
+                        return Flux.empty();
+                    }
+
+                    if (snapshot == null || snapshot.isEmpty()) {
+                        return Flux.empty();
+                    }
+
+                    List<WaveformData> waveforms = new ArrayList<>(snapshot.size());
                     long now = System.currentTimeMillis();
 
-                    for (TrackRuntime runtime : trackRuntimes.values()) {
-                        if (!runtime.isPlaying()) continue;
+                    for (TrackRuntime runtime : snapshot.values()) {
+                        try {
+                            if (runtime == null || runtime.getTrack() == null) continue;
+                            if (!runtime.isPlaying()) continue;
 
-                        double elapsed = (now - runtime.getStartTime()) / 1000.0;
-                        runtime.setCurrentTime(elapsed);
+                            double elapsed = (now - runtime.getStartTime()) / 1000.0;
+                            if (elapsed < 0) elapsed = 0;
+                            runtime.setCurrentTime(elapsed);
 
-                        List<Double> amplitudes = generateWaveform(runtime, 64);
-                        double rms = calculateRMS(amplitudes);
+                            List<Double> amplitudes = generateWaveform(runtime, 64);
+                            double rms = calculateRMS(amplitudes);
 
-                        waveforms.add(WaveformData.builder()
-                                .trackId(runtime.getTrack().getId())
-                                .amplitudes(amplitudes)
-                                .currentVolume(rms * runtime.getTrack().getVolume())
-                                .timestamp(now)
-                                .build());
+                            waveforms.add(WaveformData.builder()
+                                    .trackId(runtime.getTrack().getId())
+                                    .amplitudes(amplitudes)
+                                    .currentVolume(rms * runtime.getTrack().getVolume())
+                                    .timestamp(now)
+                                    .build());
+                        } catch (Exception e) {
+                            log.warn("生成音轨 {} 波形数据异常: {}",
+                                    runtime != null && runtime.getTrack() != null
+                                            ? runtime.getTrack().getName() : "unknown",
+                                    e.getMessage());
+                        }
                     }
 
                     return Flux.fromIterable(waveforms);
-                });
+                }, 1)
+                .onErrorContinue((ex, obj) ->
+                        log.error("波形流单条数据异常, 已跳过: {}", ex.getMessage()))
+                .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofMillis(100))
+                        .maxBackoff(Duration.ofSeconds(1))
+                        .doBeforeRetry(signal ->
+                                log.warn("波形流异常重试 #{}: {}",
+                                        signal.totalRetries() + 1, signal.failure().getMessage())));
     }
 
     private List<Double> generateWaveform(TrackRuntime runtime, int size) {
         List<Double> amplitudes = new ArrayList<>(size);
+        if (runtime == null || runtime.getTrack() == null) {
+            for (int i = 0; i < size; i++) amplitudes.add(0.0);
+            return amplitudes;
+        }
         double baseVolume = runtime.getTrack().getVolume();
         double phase = runtime.getPhase();
         double freq = runtime.getFrequency();
@@ -276,7 +362,7 @@ public class AudioService {
     }
 
     private double calculateRMS(List<Double> samples) {
-        if (samples.isEmpty()) return 0;
+        if (samples == null || samples.isEmpty()) return 0;
         double sum = 0;
         for (double s : samples) {
             sum += s * s;
@@ -290,10 +376,10 @@ public class AudioService {
     @lombok.AllArgsConstructor
     private static class TrackRuntime {
         private Track track;
-        private boolean playing;
-        private double currentTime;
-        private long startTime;
-        private double phase;
-        private double frequency;
+        private volatile boolean playing;
+        private volatile double currentTime;
+        private volatile long startTime;
+        private volatile double phase;
+        private volatile double frequency;
     }
 }

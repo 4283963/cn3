@@ -86,8 +86,13 @@ const trackTypeLabel = computed(() => {
 })
 
 const glowOpacity = computed(() => {
-  if (!props.isPlaying || props.amplitudes.length === 0) return 0.1
-  const avg = props.amplitudes.reduce((a, b) => a + Math.abs(b), 0) / props.amplitudes.length
+  if (!props.isPlaying || !props.amplitudes || props.amplitudes.length === 0) return 0.1
+  let sum = 0
+  for (let i = 0; i < props.amplitudes.length; i++) {
+    const v = props.amplitudes[i]
+    sum += typeof v === 'number' && isFinite(v) ? Math.abs(v) : 0
+  }
+  const avg = sum / props.amplitudes.length
   return Math.min(0.6, 0.1 + avg * 0.8)
 })
 
@@ -129,14 +134,21 @@ function drawWaveform() {
 
   for (let i = 0; i < barCount; i++) {
     let targetValue = 0
-    if (props.isPlaying && props.amplitudes.length > 0) {
-      const idx = Math.floor(i * props.amplitudes.length / barCount)
-      targetValue = Math.abs(props.amplitudes[idx] || 0) * 2
+    if (props.isPlaying && props.amplitudes && props.amplitudes.length > 0) {
+      const ratio = props.amplitudes.length / barCount
+      const idx = Math.min(Math.floor(i * ratio), props.amplitudes.length - 1)
+      const raw = props.amplitudes[idx]
+      if (typeof raw === 'number' && isFinite(raw)) {
+        targetValue = Math.abs(raw) * 2
+      }
     }
 
-    displayAmplitudes[i] = displayAmplitudes[i] * 0.7 + targetValue * 0.3
+    const prev = typeof displayAmplitudes[i] === 'number' && isFinite(displayAmplitudes[i])
+      ? displayAmplitudes[i] : 0
+    displayAmplitudes[i] = prev * 0.7 + targetValue * 0.3
+    if (!isFinite(displayAmplitudes[i])) displayAmplitudes[i] = 0
 
-    const barHeight = Math.max(2, displayAmplitudes[i] * height * 0.8)
+    const barHeight = Math.max(2, Math.abs(displayAmplitudes[i]) * height * 0.8)
     const x = 10 + i * (barWidth + 2)
 
     const gradient = ctx.createLinearGradient(0, centerY - barHeight / 2, 0, centerY + barHeight / 2)
