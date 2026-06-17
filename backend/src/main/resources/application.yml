@@ -1,0 +1,18 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: audio-control
+  webflux:
+    static-path-pattern: /**
+
+audio:
+  sample-rate: 44100
+  buffer-size: 4096
+  waveform-update-interval: 50
+
+logging:
+  level:
+    com.murder.mystery: DEBUG
+    org.springframework.web: INFO
